@@ -1,3 +1,4 @@
 data/inputs/*.csv
 data/*.xlsx
 *__pycache__/
+.vscode/
