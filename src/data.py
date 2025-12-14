@@ -3,6 +3,7 @@ import numpy as np
 from sklearn.feature_selection import SelectKBest, mutual_info_classif
 from sklearn.decomposition import PCA
 from sklearn.ensemble import RandomForestClassifier
+from sklearn.base import BaseEstimator, TransformerMixin
 
 
 def filter_data_date(data, reference_date):
@@ -11,7 +12,35 @@ def filter_data_date(data, reference_date):
     data = data.dropna(subset=['visit_date'], ignore_index=True)
     data = data[data['visit_date'] < reference_date]
     return data.sort_values(by=['record_id', 'visit_date'], ascending=[True, False]).drop_duplicates(subset=['record_id'], keep='first')
+class DropAllMissingColumns(BaseEstimator, TransformerMixin):
+    """Drop columns that are entirely missing in the training fold.
 
+    This avoids SimpleImputer warnings/errors when a column has no observed values
+    in a particular split (even if it exists in the full dataset).
+    """
+
+    def fit(self, X, y=None):
+        if isinstance(X, pd.DataFrame):
+            self.keep_columns_ = X.columns[~X.isna().all(axis=0)].tolist()
+            self.keep_mask_ = None
+        else:
+            arr = np.asarray(X)
+            # assumes missing values are represented as NaN
+            self.keep_mask_ = ~np.all(np.isnan(arr), axis=0)
+            self.keep_columns_ = None
+        return self
+
+    def transform(self, X):
+        if isinstance(X, pd.DataFrame):
+            keep = getattr(self, "keep_columns_", None)
+            if keep is None:
+                return X
+            return X.loc[:, keep]
+        arr = np.asarray(X)
+        mask = getattr(self, "keep_mask_", None)
+        if mask is None:
+            return arr
+        return arr[:, mask]
 
 def _binary_encode(series: pd.Series) -> pd.Series:
     """Stable binary encoding without relying on `unique()` order.
