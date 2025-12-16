@@ -139,7 +139,7 @@ def create_features_background(df, reference_date):
     data['ab_chuv_igg_n_logratio'] = pd.to_numeric(df['ab_chuv_igg_n_logratio'], errors="coerce")
     data['ab_chuv_iga_logratio'] = pd.to_numeric(df['ab_chuv_iga_logratio'], errors="coerce")
     data['first_exposure'] = _binary_encode(df['first_exposure'])
-    data['prior_exposure'] = _binary_encode(df['prior_exposure'])
+    data['summary_bl_behaviour'] = pd.to_numeric(df['summary_bl_behaviour'], errors="coerce")
     data['last_antibody_before_omicron_igg_n_logratio'] = pd.to_numeric(df['last_antibody_before_omicron_igg_n_logratio'], errors="coerce")
     return data
 

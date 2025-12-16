@@ -23,16 +23,46 @@ from sklearn.metrics import (
 # Threshold helpers
 
 
-def find_optimal_threshold_f1(y_true, y_proba):
-    """Find optimal threshold that maximizes F1 score."""
-    thresholds = np.arange(0.1, 1.0, 0.01)
-    f1_scores = []
-    for threshold in thresholds:
+THRESHOLD_GRID = np.arange(0.0, 1.001, 0.01)
+
+
+def _specificity_score(y_true, y_pred) -> float:
+    cm = confusion_matrix(y_true, y_pred)
+    if cm.shape != (2, 2):
+        return 0.0
+    tn, fp, _, _ = cm.ravel()
+    return float(tn / (tn + fp)) if (tn + fp) else 0.0
+
+
+def optimize_threshold_for_metric(y_true, y_proba, metric: str):
+    """Return (best_threshold, best_score) for a threshold-dependent metric."""
+
+    best_threshold = 0.5
+    best_score = -np.inf
+
+    for threshold in THRESHOLD_GRID:
         y_pred = (y_proba >= threshold).astype(int)
-        f1 = f1_score(y_true, y_pred)
-        f1_scores.append(f1)
-    optimal_idx = np.argmax(f1_scores)
-    return thresholds[optimal_idx], f1_scores[optimal_idx]
+
+        if metric == "accuracy":
+            score = accuracy_score(y_true, y_pred)
+        elif metric == "balanced_accuracy":
+            score = balanced_accuracy_score(y_true, y_pred)
+        elif metric == "f1":
+            score = f1_score(y_true, y_pred, zero_division=0)
+        elif metric == "precision":
+            score = precision_score(y_true, y_pred, zero_division=0)
+        elif metric == "recall":
+            score = recall_score(y_true, y_pred, zero_division=0)
+        elif metric == "specificity":
+            score = _specificity_score(y_true, y_pred)
+        else:
+            raise ValueError(f"Unknown metric for threshold optimization: {metric}")
+
+        if score > best_score:
+            best_score = score
+            best_threshold = float(threshold)
+
+    return float(best_threshold), float(best_score)
 
 
 def find_optimal_threshold_youden(y_true, y_proba):
@@ -59,10 +89,12 @@ STANDARD_METRICS = {
 }
 
 OPTIMIZED_METRICS = {
+    "accuracy": "Accuracy (Optimized)",
+    "balanced_accuracy": "Balanced Accuracy (Optimized)",
     "f1": "F1 Score (Optimized)",
     "precision": "Precision (Optimized)",
     "recall": "Recall (Optimized)",
-    "balanced_accuracy": "Balanced Accuracy (Optimized)",
+    "specificity": "Specificity (Optimized)",
 }
 
 
@@ -106,23 +138,12 @@ def evaluate_split(y_true, y_pred, y_proba):
     precision = precision_score(y_true, y_pred, zero_division=0)
     recall = recall_score(y_true, y_pred, zero_division=0)
 
-    cm = confusion_matrix(y_true, y_pred)
-    if cm.shape == (2, 2):
-        tn, fp, fn, tp = cm.ravel()
-        specificity = tn / (tn + fp) if (tn + fp) else 0.0
-    else:
-        specificity = 0.0
+    specificity = _specificity_score(y_true, y_pred)
 
-    threshold, _ = find_optimal_threshold_f1(y_true, y_proba)
-    y_pred_opt = (y_proba >= threshold).astype(int)
-
-    optimized = {
-        "threshold": threshold,
-        "f1": f1_score(y_true, y_pred_opt),
-        "precision": precision_score(y_true, y_pred_opt, zero_division=0),
-        "recall": recall_score(y_true, y_pred_opt, zero_division=0),
-        "balanced_accuracy": balanced_accuracy_score(y_true, y_pred_opt),
-    }
+    optimized = {}
+    for metric_key in OPTIMIZED_METRICS.keys():
+        thr, score = optimize_threshold_for_metric(y_true, y_proba, metric_key)
+        optimized[metric_key] = {"threshold": thr, "score": score}
 
     return {
         "roc_curve": (fpr, tpr),
@@ -141,7 +162,8 @@ def evaluate_split(y_true, y_pred, y_proba):
 def summarize_metrics(split_metrics: List[Mapping[str, float]], n_splits: int):
     """Summarize metric distributions across all splits for a model."""
     history = defaultdict(list)
-    optimized_history = defaultdict(list)
+    optimized_score_history = defaultdict(list)
+    optimized_threshold_history = defaultdict(list)
     roc_curves = []
     aucs = []
 
@@ -152,10 +174,18 @@ def summarize_metrics(split_metrics: List[Mapping[str, float]], n_splits: int):
         aucs.append(metrics["roc_auc"])
         optimized = metrics.get("optimized", {})
         for key in OPTIMIZED_METRICS:
-            optimized_history[key].append(optimized.get(key, np.nan))
+            entry = optimized.get(key, {})
+            optimized_score_history[key].append(entry.get("score", np.nan))
+            optimized_threshold_history[key].append(entry.get("threshold", np.nan))
 
     summary = {name: _build_stats(values, n_splits) for name, values in history.items()}
-    optimized_summary = {name: _build_stats(values, n_splits) for name, values in optimized_history.items()}
+    optimized_summary = {
+        name: {
+            "score": _build_stats(optimized_score_history[name], n_splits),
+            "threshold": _build_stats(optimized_threshold_history[name], n_splits),
+        }
+        for name in OPTIMIZED_METRICS
+    }
 
     return {
         "standard": summary,
@@ -174,13 +204,29 @@ def print_metric_summary(model_name: str, summary: Mapping[str, Mapping[str, flo
         print(f"{label}: {stats['formatted']}")
 
 
-def print_optimized_summary(model_name: str, optimized_summary: Mapping[str, Mapping[str, float | str]]):
-    print(f"\n** {model_name} (F1-Optimized Threshold) **")
+def print_optimized_summary(
+    model_name: str,
+    optimized_summary,
+    *,
+    roc_auc_stats = None,
+):
+    print(f"\n** {model_name} (Metric-Specific Optimized Thresholds) **")
+    if roc_auc_stats is not None:
+        print(f"{STANDARD_METRICS['roc_auc']}: {roc_auc_stats['formatted']}")
     for key, label in OPTIMIZED_METRICS.items():
-        stats = optimized_summary.get(key)
-        if not stats:
+        bucket = optimized_summary.get(key)
+        if not bucket:
             continue
-        print(f"{label}: {stats['formatted']}")
+        score_stats = bucket.get("score")
+        thr_stats = bucket.get("threshold")
+        if not score_stats or not thr_stats:
+            continue
+        thr_mean = thr_stats.get("mean")
+        thr_std = thr_stats.get("std")
+        thr_text = ""
+        if isinstance(thr_mean, (float, int)) and isinstance(thr_std, (float, int)) and not np.isnan(thr_mean) and not np.isnan(thr_std):
+            thr_text = f" (thr={thr_mean:.2f}±{thr_std:.2f})"
+        print(f"{label}: {score_stats['formatted']}{thr_text}")
 
 
 # ---------------------------------------------------------------------------

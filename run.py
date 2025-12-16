@@ -2,6 +2,7 @@ from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Dict, List
 import warnings
+from functools import partial
 
 import numpy as np
 import pandas as pd
@@ -9,6 +10,7 @@ from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
 from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.feature_selection import SelectKBest, mutual_info_classif
+from sklearn.base import BaseEstimator, TransformerMixin
 
 from sklearn.impute import SimpleImputer
 from sklearn.pipeline import Pipeline
@@ -46,6 +48,7 @@ DATA_MODES = ("agnostic", "background", "sequence")
 N_SPLITS = 10
 TEST_SIZE = 0.2
 RANDOM_STATE = 42
+K_MI_CAP = 100
 
 # Flags for agnostic filtering
 APPLY_PCA = False
@@ -61,16 +64,17 @@ COLOR_MAP = {"background": "tab:blue", "agnostic": "tab:orange", "sequence": "ta
 
 MODEL_CONFIGS = {
     "RandomForest": {
-        "factory": lambda: RandomForestClassifier(random_state=RANDOM_STATE),
-        "search_spaces": {
-            "n_estimators": Integer(10, 1000),
-            "max_depth": Integer(1, 60),
+        "factory": lambda: RandomForestClassifier(random_state=RANDOM_STATE, n_jobs=-1),
+        "search_spaces": { 
+            "n_estimators": Integer(200, 2000),
+            "max_depth": Integer(2, 60),
             "min_samples_split": Integer(2, 50),
-            "min_samples_leaf": Integer(1, 20),
+            "min_samples_leaf": Integer(1, 100),
             "max_features": Categorical([None, "sqrt", "log2"]),
             "bootstrap": Categorical([True, False]),
             "criterion": Categorical(["gini", "entropy"]),
-            "class_weight": Categorical(["balanced", None]),
+            "class_weight": Categorical(["balanced", "balanced_subsample", None]),
+            "ccp_alpha": Real(0.0, 0.02),
         },
     },
     "LogisticRegression": {
@@ -134,6 +138,9 @@ MODEL_CONFIGS = {
 #MODEL_CONFIGS = {"RandomForest": MODEL_CONFIGS["RandomForest"]}
 
 
+
+
+
 def sanitize_columns(df: pd.DataFrame) -> pd.DataFrame:
     df.columns = df.columns.astype(str).str.replace(r"[\\[\\]<>]", "", regex=True)
     return df
@@ -166,23 +173,28 @@ def _build_pipeline_and_search_space(
     n_features: int,
     enable_selector: bool,
     k_default: int,
+    use_scaler: bool,
 ):
     steps = [
         ("drop_empty", data_utils.DropAllMissingColumns()),
         ("imputer", SimpleImputer(strategy="median", add_indicator=True)),
-        ("scaler", StandardScaler()),
     ]
+
+    if use_scaler:
+        steps.append(("scaler", StandardScaler()))
 
     spaces_prefixed = _prefix_search_spaces(search_spaces, "clf__")
 
     if data_mode == "agnostic" and enable_selector:
-        k_max = max(1, min(k_default, n_features))
-        steps.append(("selector", SelectKBest(mutual_info_classif, k=k_max)))
+        k_cap = max(1, min(n_features, K_MI_CAP))
+        k_init = max(1, min(k_default, k_cap))
+        mi = partial(mutual_info_classif, random_state=RANDOM_STATE)
+        steps.append(("selector", SelectKBest(mi, k=k_init)))
         if isinstance(spaces_prefixed, list):
             for space in spaces_prefixed:
-                space["selector__k"] = Integer(1, k_max)
+                space["selector__k"] = Integer(1, k_cap)
         else:
-            spaces_prefixed["selector__k"] = Integer(1, k_max)
+            spaces_prefixed["selector__k"] = Integer(1, k_cap)
 
     steps.append(("clf", estimator_factory()))
     pipe = Pipeline(steps)
@@ -253,6 +265,9 @@ def train_models_for_mode(
         last_importances = None
 
         n_features = X.shape[1]
+
+        # Scaling helps linear models; it is unnecessary for RF/boosting.
+        use_scaler = model_name in {"LogisticRegression", "LinearDiscriminantAnalysis"}
         estimator, search_spaces = _build_pipeline_and_search_space(
             estimator_factory=config["factory"],
             search_spaces=config["search_spaces"],
@@ -260,6 +275,7 @@ def train_models_for_mode(
             n_features=n_features,
             enable_selector=FILTER_MI,
             k_default=K_MI,
+            use_scaler=use_scaler,
         )
 
         split_iter = range(N_SPLITS)
@@ -324,15 +340,16 @@ def train_models_for_mode(
         metric_summaries[model_name] = summary["standard"]
         optimized_summaries[model_name] = summary["optimized"]
 
-        #eval_utils.print_metric_summary(model_name, summary["standard"])
+        eval_utils.print_metric_summary(model_name, summary["standard"])
 
         if model_name == "RandomForest" and last_importances is not None:
             last_feats = feature_names_per_split[model_name][-1] if feature_names_per_split[model_name] else list(X.columns)
             rf_feature_importances = dict(zip(last_feats, last_importances))
 
-    print("\n=== Optimized Threshold Metrics (F1-Optimized Threshold) ===")
+    print("\n=== Optimized Threshold Metrics (Metric-Specific Optimized Thresholds) ===")
     for model_name, summary in optimized_summaries.items():
-        eval_utils.print_optimized_summary(model_name, summary)
+        roc_auc_stats = metric_summaries.get(model_name, {}).get("roc_auc")
+        eval_utils.print_optimized_summary(model_name, summary, roc_auc_stats=roc_auc_stats)
 
     param_summaries = {m: summarize_parameters(splits) for m, splits in split_params.items()}
     if False:
